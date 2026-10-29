@@ -18,5 +18,7 @@ app/src/main/assets/licenses/qnn-*
 # Kotlin compiler session artifacts
 .kotlin/
 
+__pycache__/
+
 app/src/main/cpp/build/
 app/src/main/assets/ditlibs
