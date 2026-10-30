@@ -1,6 +1,12 @@
 import unittest
 
-from wait_and_package_v73 import component_ids, component_ready, job_id_from_url, terminal_failure
+from wait_and_package_v73 import (
+    component_ids,
+    component_ready,
+    evaluate_unet_candidates,
+    job_id_from_url,
+    terminal_failure,
+)
 
 
 class WaitAndPackageGateTests(unittest.TestCase):
@@ -30,6 +36,50 @@ class WaitAndPackageGateTests(unittest.TestCase):
         ready, detail = component_ready(record, "U-Net")
         self.assertFalse(ready)
         self.assertIn("inference-profile job URL", detail)
+
+    def test_first_ready_candidate_wins_when_both_are_ready(self):
+        selected, _, all_terminal = evaluate_unet_candidates(
+            [("U-Net W8A16", self.record), ("U-Net W4A16", self.record)]
+        )
+        self.assertEqual(selected, ("U-Net W8A16", self.record))
+        self.assertFalse(all_terminal)
+
+    def test_ready_w4_candidate_is_selected_while_w8_waits(self):
+        pending = dict(self.record)
+        pending.pop("inference_job_url")
+        pending["htp_execution_verified"] = False
+        selected, _, all_terminal = evaluate_unet_candidates(
+            [("U-Net W8A16", pending), ("U-Net W4A16", self.record)]
+        )
+        self.assertEqual(selected, ("U-Net W4A16", self.record))
+        self.assertFalse(all_terminal)
+
+    def test_failed_candidate_does_not_block_other_ready_candidate(self):
+        failed = dict(self.record, compile_statuses=["CODE: FAILED; MESSAGE: optimizer error"])
+        selected, reasons, all_terminal = evaluate_unet_candidates(
+            [("U-Net W8A16", failed), ("U-Net W4A16", self.record)]
+        )
+        self.assertEqual(selected, ("U-Net W4A16", self.record))
+        self.assertTrue(any("terminal job failure" in reason for reason in reasons))
+        self.assertFalse(all_terminal)
+
+    def test_all_terminal_candidates_stop_the_gate(self):
+        failed = dict(self.record, compile_statuses=["CODE: FAILED"])
+        selected, _, all_terminal = evaluate_unet_candidates(
+            [("U-Net W8A16", failed), ("U-Net W4A16", failed)]
+        )
+        self.assertIsNone(selected)
+        self.assertTrue(all_terminal)
+
+    def test_pending_candidates_keep_the_gate_waiting(self):
+        pending = dict(self.record)
+        pending.pop("inference_job_url")
+        pending["htp_execution_verified"] = False
+        selected, _, all_terminal = evaluate_unet_candidates(
+            [("U-Net W8A16", pending), ("U-Net W4A16", pending)]
+        )
+        self.assertIsNone(selected)
+        self.assertFalse(all_terminal)
 
     def test_mixed_cpu_npu_profile_is_terminal_failure(self):
         record = dict(self.record, profile_compute_units=["NPU", "CPU"])

@@ -95,6 +95,28 @@ def component_ready(record: dict[str, Any], label: str) -> tuple[bool, str]:
     return True, f"{label}: confirmed {units} on Samsung Galaxy S23"
 
 
+def evaluate_unet_candidates(
+    candidates: list[tuple[str, dict[str, Any] | None]],
+) -> tuple[tuple[str, dict[str, Any]] | None, list[str], bool]:
+    reasons: list[str] = []
+    all_terminal = bool(candidates)
+    for label, record in candidates:
+        if record is None:
+            all_terminal = False
+            reasons.append(f"{label}: manifest not available/readable yet")
+            continue
+        failure = terminal_failure(record, label)
+        if failure:
+            reasons.append(failure)
+            continue
+        all_terminal = False
+        ready, reason = component_ready(record, label)
+        if ready:
+            return (label, record), reasons, False
+        reasons.append(reason)
+    return None, reasons, all_terminal
+
+
 def component_ids(record: dict[str, Any], label: str) -> dict[str, str]:
     urls = record.get("compile_job_urls")
     if not isinstance(urls, list) or len(urls) != 1 or not all(isinstance(url, str) for url in urls):
@@ -115,7 +137,8 @@ def main() -> int:
     parser.add_argument(
         "--unet-pipeline",
         type=pathlib.Path,
-        default=pathlib.Path("/workspace/sdxl-export/v73-unet-allbiased-allmatmuladd-rescaled-customcal-w8a16/pipeline.json"),
+        action="append",
+        help="Existing U-Net pipeline manifest; may be repeated. First fully NPU-profiled candidate wins.",
     )
     parser.add_argument(
         "--vae-encoder-jobs",
@@ -147,22 +170,37 @@ def main() -> int:
     if args.output.exists():
         parser.error(f"Refusing to overwrite existing candidate: {args.output}")
 
-    paths = (
-        ("U-Net", args.unet_pipeline),
+    default_unet = pathlib.Path("/workspace/sdxl-export/v73-unet-allbiased-allmatmuladd-rescaled-customcal-w8a16/pipeline.json")
+    unet_paths = args.unet_pipeline or [default_unet]
+    if len(set(unet_paths)) != len(unet_paths):
+        parser.error("--unet-pipeline paths must be unique")
+    vae_paths = (
         ("VAE encoder", args.vae_encoder_jobs),
         ("VAE decoder", args.vae_decoder_jobs),
     )
     deadline = time.monotonic() + args.timeout_seconds if args.timeout_seconds > 0 else None
     last_report = 0.0
-    print("Waiting for existing reference profiles; no AI Hub jobs will be submitted.", flush=True)
+    print(f"Waiting for one of {len(unet_paths)} existing U-Net reference profiles; no AI Hub jobs will be submitted.", flush=True)
     while True:
-        records = {label: load_record(path) for label, path in paths}
-        reasons = []
-        ready = True
-        for label, _ in paths:
-            record = records[label]
+        candidates = []
+        for index, path in enumerate(unet_paths, start=1):
+            record = load_record(path)
+            variant = record.get("model_variant") if record else None
+            label = f"U-Net {variant}" if variant else ("U-Net" if len(unet_paths) == 1 else f"U-Net candidate {index}")
+            candidates.append((label, record))
+        selected_unet, reasons, all_unet_terminal = evaluate_unet_candidates(candidates)
+        if all_unet_terminal:
+            print("All U-Net candidates reached terminal failure:", file=sys.stderr, flush=True)
+            print("\n".join(reasons), file=sys.stderr, flush=True)
+            return 2
+
+        records: dict[str, dict[str, Any] | None] = {}
+        vaes_ready = True
+        for label, path in vae_paths:
+            record = load_record(path)
+            records[label] = record
             if record is None:
-                ready = False
+                vaes_ready = False
                 reasons.append(f"{label}: manifest not available/readable yet")
                 continue
             failure = terminal_failure(record, label)
@@ -170,10 +208,12 @@ def main() -> int:
                 print(failure, file=sys.stderr, flush=True)
                 return 2
             ok, reason = component_ready(record, label)
-            ready = ready and ok
+            vaes_ready = vaes_ready and ok
             reasons.append(reason)
 
-        if ready:
+        if selected_unet is not None and vaes_ready:
+            selected_unet_label, records["U-Net"] = selected_unet
+            print(f"Selected first ready candidate: {selected_unet_label}", flush=True)
             break
         now = time.monotonic()
         if now - last_report >= 300:
@@ -197,7 +237,11 @@ def main() -> int:
         print("QAI_HUB_API_TOKEN is required to validate and stream AI Hub artifacts.", file=sys.stderr)
         return 2
 
-    ids = {label: component_ids(records[label], label) for label, _ in paths}
+    ids = {
+        "U-Net": component_ids(records["U-Net"], selected_unet_label),
+        "VAE encoder": component_ids(records["VAE encoder"], "VAE encoder"),
+        "VAE decoder": component_ids(records["VAE decoder"], "VAE decoder"),
+    }
     builder = pathlib.Path(__file__).with_name("build_v73_package.py")
     command = [
         sys.executable,
