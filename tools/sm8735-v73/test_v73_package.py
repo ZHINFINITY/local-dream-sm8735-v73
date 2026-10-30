@@ -70,6 +70,26 @@ class V73ProfileTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "Incomplete Local Dream SDXL package"):
                 package_candidate(package_dir, root / "candidate.zip", 43)
 
+    def test_profile_claim_requires_each_component_link_job_id(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = pathlib.Path(temp)
+            package_dir = root / "model"
+            package_dir.mkdir()
+            for name in REQUIRED_FILES:
+                (package_dir / name).write_bytes(b"")
+
+            with self.assertRaisesRegex(ValueError, "VAE decoder SM8550 profile claim requires"):
+                package_candidate(
+                    package_dir,
+                    root / "candidate.zip",
+                    43,
+                    unet_htp_profiled_sm8550=True,
+                    vae_encoder_htp_profiled_sm8550=True,
+                    vae_decoder_htp_profiled_sm8550=True,
+                    unet_link_job_id="unet-link",
+                    vae_encoder_link_job_id="encoder-link",
+                )
+
     def test_package_streams_unet_context_from_memory(self):
         with tempfile.TemporaryDirectory() as temp:
             root = pathlib.Path(temp)
@@ -90,9 +110,70 @@ class V73ProfileTests(unittest.TestCase):
 
             with zipfile.ZipFile(output) as archive:
                 self.assertEqual(archive.read(str(PACKAGE_PREFIX / "unet.bin")), context)
+                contents = json.loads(archive.read(str(PACKAGE_PREFIX / "PACKAGE_CONTENTS.json")))
                 metadata = json.loads(archive.read(str(PACKAGE_PREFIX / "EXPERIMENTAL_V73_UNVALIDATED.json")))
             self.assertEqual(metadata["unet_context_sha256"], hashlib.sha256(context).hexdigest())
+            self.assertEqual(contents["files"]["unet.bin"]["sha256"], hashlib.sha256(context).hexdigest())
             self.assertEqual(metadata["sm8550_reference_job_ids"]["unet_link_job_id"], "jtestlink")
+
+    def test_companion_hash_mismatch_fails_without_deleting_sources(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = pathlib.Path(temp)
+            package_dir = root / "model"
+            package_dir.mkdir()
+            for name in REQUIRED_FILES:
+                (package_dir / name).write_bytes(b"asset")
+            (package_dir / "clip.mnn").write_bytes(b"actual bytes")
+            declared = b"different bytes"
+            manifest = {
+                "files": {
+                    "clip.mnn": {
+                        "size_bytes": len(declared),
+                        "sha256": hashlib.sha256(declared).hexdigest(),
+                    }
+                }
+            }
+            (package_dir / "MNN_COMPANIONS_SOURCE.json").write_text(json.dumps(manifest))
+            output = root / "candidate.zip"
+
+            with self.assertRaisesRegex(ValueError, "does not match its source manifest"):
+                package_candidate(package_dir, output, 43, consume_source_files=True)
+
+            self.assertTrue((package_dir / "clip.mnn").is_file())
+            self.assertFalse(output.exists())
+
+    def test_output_inside_package_dir_is_rejected_without_deletion(self):
+        with tempfile.TemporaryDirectory() as temp:
+            package_dir = pathlib.Path(temp) / "model"
+            package_dir.mkdir()
+            for name in REQUIRED_FILES:
+                (package_dir / name).write_bytes(b"asset")
+            output = package_dir / "candidate.zip"
+
+            with self.assertRaisesRegex(ValueError, "outside package_dir"):
+                package_candidate(package_dir, output, 43, consume_source_files=True)
+
+            self.assertTrue(all((package_dir / name).is_file() for name in REQUIRED_FILES))
+            self.assertFalse(output.exists())
+
+    def test_consume_happens_only_after_archive_validation(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = pathlib.Path(temp)
+            package_dir = root / "model"
+            package_dir.mkdir()
+            for name in REQUIRED_FILES:
+                (package_dir / name).write_bytes(b"asset")
+            (package_dir / "MODEL_SOURCE.md").write_text("source provenance")
+            (package_dir / "unrelated-note.txt").write_text("keep this file")
+            output = root / "candidate.zip"
+
+            package_candidate(package_dir, output, 43, consume_source_files=True)
+
+            self.assertTrue(output.is_file())
+            self.assertIsNone(zipfile.ZipFile(output).testzip())
+            self.assertFalse(any((package_dir / name).exists() for name in REQUIRED_FILES))
+            self.assertTrue((package_dir / "MODEL_SOURCE.md").is_file())
+            self.assertTrue((package_dir / "unrelated-note.txt").is_file())
 
     def test_reference_profiles_do_not_claim_sm8735_validation(self):
         with tempfile.TemporaryDirectory() as temp:
@@ -110,6 +191,9 @@ class V73ProfileTests(unittest.TestCase):
                 unet_htp_profiled_sm8550=True,
                 vae_encoder_htp_profiled_sm8550=True,
                 vae_decoder_htp_profiled_sm8550=True,
+                unet_link_job_id="unet-link",
+                vae_encoder_link_job_id="encoder-link",
+                vae_decoder_link_job_id="decoder-link",
             )
 
             with zipfile.ZipFile(output) as archive:
