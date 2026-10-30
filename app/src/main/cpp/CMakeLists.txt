@@ -28,7 +28,10 @@ foreach(lib QnnHtp QnnSystem)
     file(COPY "${QNN_SDK_ROOT}/lib/aarch64-android/lib${lib}.so"
         DESTINATION "${CMAKE_CURRENT_BINARY_DIR}/qnnlibs")
 endforeach()
-foreach(arch 68 69 73 75 79 81 85)
+# This private SM8735 experiment bundles only the measured HTP v73 runtime.
+# Add other architecture IDs through -DQNN_HTP_ARCHES="73;75" if needed.
+set(QNN_HTP_ARCHES "73" CACHE STRING "HTP architecture IDs to bundle")
+foreach(arch IN LISTS QNN_HTP_ARCHES)
     file(COPY "${QNN_SDK_ROOT}/lib/aarch64-android/libQnnHtpV${arch}Stub.so"
         "${QNN_SDK_ROOT}/lib/hexagon-v${arch}/unsigned/libQnnHtpV${arch}.so"
         "${QNN_SDK_ROOT}/lib/hexagon-v${arch}/unsigned/libQnnHtpV${arch}Skel.so"

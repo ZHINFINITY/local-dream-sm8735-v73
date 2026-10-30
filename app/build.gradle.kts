@@ -30,12 +30,12 @@ android {
     compileSdk = 37
 
     defaultConfig {
-        applicationId = "io.github.xororz.localdream"
+        applicationId = "io.github.zhinfinity.localdream.sm8735"
         minSdk = 28
 //        minSdk = 31
         targetSdk = 36
         versionCode = 74
-        versionName = "3.0.0-alpha.6"
+        versionName = "3.0.0-alpha.6-sm8735-v73"
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
         vectorDrawables {
@@ -73,9 +73,6 @@ android {
             isMinifyEnabled = true
             isShrinkResources = true
             proguardFiles(getDefaultProguardFile("proguard-android-optimize.txt"), "proguard-rules.pro")
-        }
-        debug {
-            signingConfig = signingConfigs.getByName("release")
         }
     }
     compileOptions {
