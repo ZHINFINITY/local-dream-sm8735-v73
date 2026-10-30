@@ -28,7 +28,7 @@ The VAE components are exported with `export_illustrious_vae_encoder_onnx.py` an
 
 `build_android_v73_candidate.sh` is the APK workflow. It expects a preinstalled Android SDK/NDK whose terms are already accepted, plus `QNN_SDK_ROOT` pointing to the QAIRT subset. It builds for `arm64-v8a` and HTP v73, adds the NDK `libc++_shared.so` and Qualcomm notices to the staged runtime, and emits a side-by-side-installable debug APK. It does not download SDKs, accept terms, or push SDK binaries to GitHub.
 
-Once all three reference profiles have confirmed HTP, the package builder checks that each supplied compile job is a successful AI Hub `CompileJob`, each context job is a successful `LinkJob` on the expected Samsung Galaxy S23 reference, and the linked model names match their declared compile-job IDs. It also requires each link job to produce a target model. It fetches the U-Net context into memory, then writes it to the ZIP in bounded chunks (no second multi-gigabyte disk copy). A profile claim requires both that component’s compile-job ID and link-job ID. The builder does not independently retrieve inference reports, so profile flags remain caller assertions and must only be supplied after checking the recorded HTP report. It writes a temporary ZIP outside the model folder, checks staged MNN companion hashes against `MNN_COMPANIONS_SOURCE.json`, verifies the content manifest and reads every ZIP member through CRC/hash validation, then atomically publishes the final ZIP. Example command (replace the job IDs with the successful recorded IDs; pass each `--*-htp-profiled-sm8550` flag only after that component’s profile explicitly confirms HTP):
+The package builder requires a successful AI Hub `CompileJob` for each supplied `LinkJob`, checks their reference devices and compile-to-link model provenance, and requires each link job to produce a target model. For every supplied profile-job ID, it additionally verifies a successful `InferenceJob` on the expected Samsung Galaxy S23 reference, exact model-ID match with that link job’s target, and an NPU/HTP-only profile report. It records the compile, link, and inference job IDs plus the compute-unit evidence in the ZIP metadata; no manually asserted “profiled” flags are used. It fetches the U-Net context into memory, then writes it to the ZIP in bounded chunks (no second multi-gigabyte disk copy). The builder writes a temporary ZIP outside the model folder, checks staged MNN companion hashes against `MNN_COMPANIONS_SOURCE.json`, verifies the content manifest and reads every ZIP member through CRC/hash validation, then atomically publishes the final ZIP. This evidence is only for the SM8550 reference and does not establish SM8735/POCO F7 or integrated-app validation. Example command (replace the IDs with the corresponding successful recorded jobs):
 
 ```bash
 QAI_HUB_API_TOKEN=... python3 tools/sm8735-v73/build_v73_package.py package \
@@ -37,18 +37,20 @@ QAI_HUB_API_TOKEN=... python3 tools/sm8735-v73/build_v73_package.py package \
   --soc-model 43 --project <ai-hub-project-id> \
   --unet-compile-job-id <successful-unet-compile-job-id> \
   --unet-link-job-id <successful-unet-link-job-id> \
+  --unet-profile-job-id <successful-unet-inference-job-id> \
   --vae-encoder-compile-job-id <successful-encoder-compile-job-id> \
   --vae-encoder-link-job-id <successful-encoder-link-job-id> \
+  --vae-encoder-profile-job-id <successful-encoder-inference-job-id> \
   --vae-decoder-compile-job-id <successful-decoder-compile-job-id> \
   --vae-decoder-link-job-id <successful-decoder-link-job-id> \
-  --unet-htp-profiled-sm8550 \
-  --vae-encoder-htp-profiled-sm8550 \
-  --vae-decoder-htp-profiled-sm8550
+  --vae-decoder-profile-job-id <successful-decoder-inference-job-id>
 ```
+
+`wait_and_package_v73.py` is the unattended continuation for an already-running U-Net monitor. It checks the saved U-Net/VAE manifests every minute for up to 24 hours, submits no AI Hub jobs, and invokes the package builder only after all three manifests show successful NPU/HTP-only Galaxy S23 reference profiles. The builder then rechecks the actual AI Hub jobs and reports before downloading the U-Net context into the ZIP. Its default paths match this task’s staged candidate; use the CLI options to supply other paths.
 
 The output path must be outside `--package-dir`; an existing output is never overwritten. `--consume-source-files` is optional and removes only the exact runtime filenames in `REQUIRED_FILES`, after the complete ZIP passes CRC/hash verification and is atomically published. Notes, manifests, and other files are left untouched; when a runtime file is a symlink, only the staged symlink is removed, not its external target.
 
-The package manifest always marks `sm8735_poco_f7_validated` as false. Only profile flags backed by actual HTP reports should be supplied. A successful S23 profile proves HTP execution on that reference, not compatibility with the POCO F7.
+The package manifest always marks `sm8735_poco_f7_validated` as false. Only successful InferenceJob IDs whose actual reports show NPU/HTP-only execution are recorded. A successful S23 profile proves HTP execution on that reference, not compatibility with the POCO F7.
 
 ## Qualcomm target caution
 
@@ -56,4 +58,4 @@ The reference profile uses `dsp_arch=v73`, 8 MB VTCM, and `soc_model=43`, which 
 
 ## Local checks
 
-Run `python3 -m unittest discover -s tools/sm8735-v73 -p 'test_*.py' -v` to test v73 profile generation, package validation, source-manifest hash failures, safe deferred cleanup, in-memory U-Net context packaging, and SDK destination-path safety. These unit tests do not validate Qualcomm compilation or device inference.
+Run `python3 -m unittest discover -s tools/sm8735-v73 -p 'test_*.py' -v` to test v73 profile generation, package validation, compile/link/profile provenance, NPU-only evidence gates, safe deferred cleanup, in-memory U-Net context packaging, automatic waiter failure/readiness logic, and SDK destination-path safety. These unit tests do not validate Qualcomm compilation or device inference.

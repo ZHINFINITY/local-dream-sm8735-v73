@@ -8,6 +8,8 @@ import zipfile
 from build_v73_package import (
     PACKAGE_PREFIX,
     REQUIRED_FILES,
+    _collect_compute_units,
+    _confirms_npu_only,
     _link_job_matches_compile_id,
     package_candidate,
     prepare_v73_profile,
@@ -23,6 +25,13 @@ class V73ProfileTests(unittest.TestCase):
         self.assertTrue(_link_job_matches_compile_id(link_job, "compile123"))
         link_job.models = [unrelated]
         self.assertFalse(_link_job_matches_compile_id(link_job, "compile123"))
+
+    def test_profile_parser_rejects_any_non_npu_compute_unit(self):
+        report = {"layer_profile": [{"compute_unit": "NPU"}, {"compute_unit": ["HTP"]}]}
+        units = _collect_compute_units(report)
+        self.assertEqual(units, ["HTP", "NPU"])
+        self.assertTrue(_confirms_npu_only(units))
+        self.assertFalse(_confirms_npu_only(["NPU", "CPU"]))
 
     def test_profile_targets_v73_with_8mb_vtcm_and_sm8550_reference_id(self):
         with tempfile.TemporaryDirectory() as temp:
@@ -98,14 +107,9 @@ class V73ProfileTests(unittest.TestCase):
                     package_dir,
                     root / "candidate.zip",
                     43,
-                    unet_htp_profiled_sm8550=True,
-                    vae_encoder_htp_profiled_sm8550=True,
                     vae_decoder_htp_profiled_sm8550=True,
-                    unet_compile_job_id="unet-compile",
-                    vae_encoder_compile_job_id="encoder-compile",
                     vae_decoder_compile_job_id="decoder-compile",
-                    unet_link_job_id="unet-link",
-                    vae_encoder_link_job_id="encoder-link",
+                    vae_decoder_profile_job_id="decoder-profile",
                 )
 
     def test_profile_claim_requires_source_compile_job_id(self):
@@ -123,6 +127,40 @@ class V73ProfileTests(unittest.TestCase):
                     43,
                     unet_htp_profiled_sm8550=True,
                     unet_link_job_id="unet-link",
+                )
+
+    def test_profile_claim_requires_profile_job_and_validated_npu_evidence(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = pathlib.Path(temp)
+            package_dir = root / "model"
+            package_dir.mkdir()
+            for name in REQUIRED_FILES:
+                (package_dir / name).write_bytes(b"")
+
+            shared = dict(
+                unet_htp_profiled_sm8550=True,
+                unet_compile_job_id="unet-compile",
+                unet_link_job_id="unet-link",
+                unet_profile_job_id="unet-profile",
+            )
+            with self.assertRaisesRegex(ValueError, "requires matching validated profile evidence"):
+                package_candidate(package_dir, root / "missing-evidence.zip", 43, **shared)
+
+            evidence = {
+                "unet": {
+                    "profile_job_id": "unet-profile",
+                    "status": "SUCCESS",
+                    "device": "Samsung Galaxy S23",
+                    "compute_units": ["NPU", "CPU"],
+                }
+            }
+            with self.assertRaisesRegex(ValueError, "requires an NPU/HTP-only profile"):
+                package_candidate(
+                    package_dir,
+                    root / "mixed-compute.zip",
+                    43,
+                    reference_profile_evidence=evidence,
+                    **shared,
                 )
 
     def test_package_streams_unet_context_from_memory(self):
@@ -232,6 +270,35 @@ class V73ProfileTests(unittest.TestCase):
                 unet_link_job_id="unet-link",
                 vae_encoder_link_job_id="encoder-link",
                 vae_decoder_link_job_id="decoder-link",
+                unet_profile_job_id="unet-profile",
+                vae_encoder_profile_job_id="encoder-profile",
+                vae_decoder_profile_job_id="decoder-profile",
+                reference_profile_evidence={
+                    "unet": {
+                        "profile_job_id": "unet-profile",
+                        "status": "SUCCESS",
+                        "device": "Samsung Galaxy S23",
+                        "model_id": "unet-target",
+                        "model_name": "job_unet-link_linked_bin",
+                        "compute_units": ["NPU"],
+                    },
+                    "vae_encoder": {
+                        "profile_job_id": "encoder-profile",
+                        "status": "SUCCESS",
+                        "device": "Samsung Galaxy S23",
+                        "model_id": "encoder-target",
+                        "model_name": "job_encoder-link_linked_bin",
+                        "compute_units": ["NPU"],
+                    },
+                    "vae_decoder": {
+                        "profile_job_id": "decoder-profile",
+                        "status": "SUCCESS",
+                        "device": "Samsung Galaxy S23",
+                        "model_id": "decoder-target",
+                        "model_name": "job_decoder-link_linked_bin",
+                        "compute_units": ["NPU"],
+                    },
+                },
             )
 
             with zipfile.ZipFile(output) as archive:
@@ -245,6 +312,14 @@ class V73ProfileTests(unittest.TestCase):
             self.assertEqual(
                 metadata["sm8550_reference_job_ids"]["unet_compile_job_id"],
                 "unet-compile",
+            )
+            self.assertEqual(
+                metadata["sm8550_reference_job_ids"]["unet_profile_job_id"],
+                "unet-profile",
+            )
+            self.assertEqual(
+                metadata["sm8550_reference_profile_evidence"]["unet"]["compute_units"],
+                ["NPU"],
             )
 
 

@@ -80,6 +80,37 @@ def _link_job_matches_compile_id(link_job: Any, compile_job_id: str) -> bool:
     )
 
 
+def _collect_compute_units(value: Any) -> list[str]:
+    units: set[str] = set()
+
+    def walk(item: Any) -> None:
+        if isinstance(item, dict):
+            for key, child in item.items():
+                normalized = "".join(ch for ch in str(key).lower() if ch.isalnum())
+                if "computeunit" in normalized:
+                    if isinstance(child, (str, int, float)):
+                        units.add(str(child))
+                    elif isinstance(child, list):
+                        units.update(
+                            str(entry) for entry in child if isinstance(entry, (str, int, float))
+                        )
+                walk(child)
+        elif isinstance(item, list):
+            for child in item:
+                walk(child)
+
+    walk(value)
+    return sorted(units)
+
+
+def _confirms_npu_only(units: list[str]) -> bool:
+    normalized = {
+        str(unit).upper().replace(" ", "").replace("_", "").replace("-", "")
+        for unit in units
+    }
+    return bool(normalized) and normalized.issubset({"NPU", "HTP", "QNNNPU", "QNNHTP"})
+
+
 def _replace_single_line(
     text: str,
     pattern: str,
@@ -185,6 +216,10 @@ def package_candidate(
     unet_link_job_id: str | None = None,
     vae_encoder_link_job_id: str | None = None,
     vae_decoder_link_job_id: str | None = None,
+    unet_profile_job_id: str | None = None,
+    vae_encoder_profile_job_id: str | None = None,
+    vae_decoder_profile_job_id: str | None = None,
+    reference_profile_evidence: dict[str, dict[str, Any]] | None = None,
     consume_source_files: bool = False,
 ) -> pathlib.Path:
     """Build an atomic, hash-checked package; optional cleanup happens only after verification."""
@@ -200,25 +235,50 @@ def package_candidate(
         raise ValueError("Output ZIP must be outside package_dir")
     if output_path.exists():
         raise ValueError(f"Refusing to overwrite existing output: {output_path}")
-    for label, profiled, compile_job_id, job_id in (
-        ("U-Net", unet_htp_profiled_sm8550, unet_compile_job_id, unet_link_job_id),
+    profile_evidence = reference_profile_evidence or {}
+    for label, key, profiled, compile_job_id, job_id, profile_job_id in (
+        (
+            "U-Net",
+            "unet",
+            unet_htp_profiled_sm8550,
+            unet_compile_job_id,
+            unet_link_job_id,
+            unet_profile_job_id,
+        ),
         (
             "VAE encoder",
+            "vae_encoder",
             vae_encoder_htp_profiled_sm8550,
             vae_encoder_compile_job_id,
             vae_encoder_link_job_id,
+            vae_encoder_profile_job_id,
         ),
         (
             "VAE decoder",
+            "vae_decoder",
             vae_decoder_htp_profiled_sm8550,
             vae_decoder_compile_job_id,
             vae_decoder_link_job_id,
+            vae_decoder_profile_job_id,
         ),
     ):
         if profiled and not job_id:
             raise ValueError(f"A {label} SM8550 profile claim requires its linked context job ID")
         if profiled and not compile_job_id:
             raise ValueError(f"A {label} SM8550 profile claim requires its source compile job ID")
+        if profiled and not profile_job_id:
+            raise ValueError(f"A {label} SM8550 profile claim requires its InferenceJob ID")
+        if profiled:
+            evidence = profile_evidence.get(key)
+            if not evidence or evidence.get("profile_job_id") != profile_job_id:
+                raise ValueError(f"A {label} SM8550 profile claim requires matching validated profile evidence")
+            if str(evidence.get("status", "")).upper() not in {"SUCCESS", "DONE", "JOB_STATE_DONE"}:
+                raise ValueError(f"A {label} profile evidence must be from a successful InferenceJob")
+            if int(soc_model) == 43 and evidence.get("device") != "Samsung Galaxy S23":
+                raise ValueError(f"A {label} SM8550 profile claim requires Samsung Galaxy S23 device evidence")
+            evidence_units = evidence.get("compute_units", [])
+            if not isinstance(evidence_units, list) or not _confirms_npu_only(evidence_units):
+                raise ValueError(f"A {label} SM8550 profile claim requires an NPU/HTP-only profile")
 
     found = {name for name in REQUIRED_FILES if (package_dir / name).is_file()}
     if unet_context_bytes is not None:
@@ -288,15 +348,19 @@ def package_candidate(
             else "Caller-supplied SoC model value; verify against Qualcomm documentation."
         ),
         "sm8550_reference_component_profiles": components_profiled,
-        "reference_profile_evidence_note": "Compile-job type, status, reference device, and source-model association with the LinkJob are checked by the CLI; LinkJob type, status, reference device, and target model are also checked. Profile booleans remain caller-supplied, and the builder does not independently retrieve or validate inference-profile reports.",
+        "reference_profile_evidence_note": "The CLI validates successful CompileJob and LinkJob types, reference devices, and compile-to-link model provenance. For each supplied profile job it also validates InferenceJob type/status/device, exact linked-target model identity, and NPU/HTP-only compute units from the downloaded profile report.",
         "sm8550_reference_job_ids": {
             "unet_compile_job_id": unet_compile_job_id,
             "unet_link_job_id": unet_link_job_id,
+            "unet_profile_job_id": unet_profile_job_id,
             "vae_encoder_compile_job_id": vae_encoder_compile_job_id,
             "vae_encoder_link_job_id": vae_encoder_link_job_id,
+            "vae_encoder_profile_job_id": vae_encoder_profile_job_id,
             "vae_decoder_compile_job_id": vae_decoder_compile_job_id,
             "vae_decoder_link_job_id": vae_decoder_link_job_id,
+            "vae_decoder_profile_job_id": vae_decoder_profile_job_id,
         },
+        "sm8550_reference_profile_evidence": profile_evidence,
         "unet_context_sha256": None,
         "sm8735_poco_f7_validated": False,
         "model_capabilities": {
@@ -304,7 +368,7 @@ def package_candidate(
             "image_to_image": "vae_encoder.bin" in found,
         },
         "validation": (
-            "The caller marked the U-Net and both VAE contexts as separately HTP-profiled on the SM8550 reference; the builder does not independently validate those reports, and the integrated app package and POCO F7 / SM8735 are not device-validated."
+            "Successful compile, link, and NPU/HTP-only inference-profile jobs were independently checked on the SM8550 reference; the integrated app package and POCO F7 / SM8735 are not device-validated."
             if all_components_profiled
             else "Not validated on POCO F7 / SM8735. Do not infer support from an SM8550 v73 reference profile or the v73 architecture alone."
         ),
@@ -425,15 +489,15 @@ def main() -> None:
     package_parser.add_argument("--package-dir", type=pathlib.Path, required=True)
     package_parser.add_argument("--output", type=pathlib.Path, required=True)
     package_parser.add_argument("--soc-model", type=int, required=True)
-    package_parser.add_argument("--unet-htp-profiled-sm8550", action="store_true")
-    package_parser.add_argument("--vae-encoder-htp-profiled-sm8550", action="store_true")
-    package_parser.add_argument("--vae-decoder-htp-profiled-sm8550", action="store_true")
     package_parser.add_argument("--unet-compile-job-id")
     package_parser.add_argument("--vae-encoder-compile-job-id")
     package_parser.add_argument("--vae-decoder-compile-job-id")
     package_parser.add_argument("--unet-link-job-id", help="Download the completed LinkJob context directly into the ZIP in memory")
     package_parser.add_argument("--vae-encoder-link-job-id")
     package_parser.add_argument("--vae-decoder-link-job-id")
+    package_parser.add_argument("--unet-profile-job-id")
+    package_parser.add_argument("--vae-encoder-profile-job-id")
+    package_parser.add_argument("--vae-decoder-profile-job-id")
     package_parser.add_argument("--project")
     package_parser.add_argument("--consume-source-files", action="store_true", help="Delete local files only after the completed ZIP passes CRC and hash verification")
 
@@ -444,28 +508,33 @@ def main() -> None:
             print(f"Prepared HTP v73 / 8 MB profile under {args.converter_root}")
         else:
             link_specs = (
-                ("U-Net", args.unet_compile_job_id, args.unet_link_job_id, args.unet_htp_profiled_sm8550),
+                ("U-Net", "unet", args.unet_compile_job_id, args.unet_link_job_id, args.unet_profile_job_id),
                 (
                     "VAE encoder",
+                    "vae_encoder",
                     args.vae_encoder_compile_job_id,
                     args.vae_encoder_link_job_id,
-                    args.vae_encoder_htp_profiled_sm8550,
+                    args.vae_encoder_profile_job_id,
                 ),
                 (
                     "VAE decoder",
+                    "vae_decoder",
                     args.vae_decoder_compile_job_id,
                     args.vae_decoder_link_job_id,
-                    args.vae_decoder_htp_profiled_sm8550,
+                    args.vae_decoder_profile_job_id,
                 ),
             )
-            for label, compile_job_id, job_id, profiled in link_specs:
-                if profiled and not job_id:
-                    raise ValueError(f"A {label} SM8550 profile claim requires its linked context job ID")
+            for label, _, compile_job_id, job_id, profile_job_id in link_specs:
                 if job_id and not compile_job_id:
                     raise ValueError(f"The {label} link job requires its source compile job ID")
+                if profile_job_id and not job_id:
+                    raise ValueError(f"The {label} profile job requires its linked context job ID")
+                if profile_job_id and not compile_job_id:
+                    raise ValueError(f"The {label} profile job requires its source compile job ID")
 
             unet_context_bytes = None
-            if any(job_id for _, _, job_id, _ in link_specs):
+            profile_evidence: dict[str, dict[str, Any]] = {}
+            if any(job_id for _, _, _, job_id, _ in link_specs):
                 import os
                 import qai_hub as hub
 
@@ -474,8 +543,9 @@ def main() -> None:
                     raise ValueError("QAI_HUB_API_TOKEN must be set when a link-job ID is used")
                 client = hub.Client(config=hub.ClientConfig(api_token=api_token, default_project=args.project))
                 verified_jobs = {}
+                verified_targets = {}
                 expected_device_name = "Samsung Galaxy S23" if int(args.soc_model) == 43 else None
-                for label, compile_job_id, job_id, _ in link_specs:
+                for label, component, compile_job_id, job_id, profile_job_id in link_specs:
                     if not job_id:
                         continue
                     compile_job = client.get_job(compile_job_id)
@@ -508,13 +578,67 @@ def main() -> None:
                         raise ValueError(
                             f"{label} link job {job_id} does not contain a source model from compile job {compile_job_id}"
                         )
-                    if not link_job.models or link_job.get_target_model() is None:
+                    linked_target_model = link_job.get_target_model()
+                    if not link_job.models or linked_target_model is None:
                         raise ValueError(f"{label} link job {job_id} did not produce a linked target model")
                     verified_jobs[label] = link_job
+                    verified_targets[label] = linked_target_model
                     print(
                         f"Verified {label} CompileJob {compile_job_id} → LinkJob {job_id} on {device_name or 'unspecified device'}",
                         flush=True,
                     )
+                    if profile_job_id:
+                        profile_job = client.get_job(profile_job_id)
+                        if not isinstance(profile_job, hub.InferenceJob):
+                            raise ValueError(
+                                f"{label} profile job {profile_job_id} is {type(profile_job).__name__}, not an AI Hub InferenceJob"
+                            )
+                        profile_status = str(profile_job.get_status()).upper()
+                        if "DONE" not in profile_status and "SUCCESS" not in profile_status:
+                            raise ValueError(f"{label} profile job {profile_job_id} is not complete: {profile_status}")
+                        profile_device_name = getattr(profile_job.device, "name", None)
+                        if expected_device_name and profile_device_name != expected_device_name:
+                            raise ValueError(
+                                f"{label} profile job {profile_job_id} targets {profile_device_name!r}, not {expected_device_name}"
+                            )
+                        profile_model = getattr(profile_job, "model", None)
+                        target_model_id = getattr(linked_target_model, "model_id", None)
+                        profile_model_id = getattr(profile_model, "model_id", None)
+                        target_model_name = getattr(linked_target_model, "name", None)
+                        profile_model_name = getattr(profile_model, "name", None)
+                        if target_model_id and profile_model_id:
+                            models_match = target_model_id == profile_model_id
+                        else:
+                            models_match = bool(target_model_name) and target_model_name == profile_model_name
+                        if not models_match:
+                            raise ValueError(
+                                f"{label} profile job {profile_job_id} did not run the exact model produced by link job {job_id}"
+                            )
+                        profile_report = profile_job.download_profile()
+                        if isinstance(profile_report, (str, pathlib.Path)):
+                            try:
+                                profile_report = json.loads(pathlib.Path(profile_report).read_text())
+                            except (OSError, json.JSONDecodeError) as error:
+                                raise ValueError(f"Could not read {label} profile report for job {profile_job_id}") from error
+                        if not isinstance(profile_report, dict):
+                            raise ValueError(f"{label} profile job {profile_job_id} returned no JSON profile report")
+                        compute_units = _collect_compute_units(profile_report)
+                        if not _confirms_npu_only(compute_units):
+                            raise ValueError(
+                                f"{label} profile job {profile_job_id} does not show NPU/HTP-only execution: {compute_units}"
+                            )
+                        profile_evidence[component] = {
+                            "profile_job_id": profile_job_id,
+                            "status": "SUCCESS",
+                            "device": profile_device_name,
+                            "model_id": profile_model_id,
+                            "model_name": profile_model_name,
+                            "compute_units": compute_units,
+                        }
+                        print(
+                            f"Verified {label} InferenceJob {profile_job_id}: {profile_device_name}, model {profile_model_id or profile_model_name}, compute units {compute_units}",
+                            flush=True,
+                        )
 
                 unet_link_job = verified_jobs.get("U-Net")
                 if unet_link_job is not None:
@@ -527,9 +651,9 @@ def main() -> None:
                 args.package_dir,
                 args.output,
                 args.soc_model,
-                unet_htp_profiled_sm8550=args.unet_htp_profiled_sm8550,
-                vae_encoder_htp_profiled_sm8550=args.vae_encoder_htp_profiled_sm8550,
-                vae_decoder_htp_profiled_sm8550=args.vae_decoder_htp_profiled_sm8550,
+                unet_htp_profiled_sm8550="unet" in profile_evidence,
+                vae_encoder_htp_profiled_sm8550="vae_encoder" in profile_evidence,
+                vae_decoder_htp_profiled_sm8550="vae_decoder" in profile_evidence,
                 unet_context_bytes=unet_context_bytes,
                 unet_compile_job_id=args.unet_compile_job_id,
                 vae_encoder_compile_job_id=args.vae_encoder_compile_job_id,
@@ -537,6 +661,10 @@ def main() -> None:
                 unet_link_job_id=args.unet_link_job_id,
                 vae_encoder_link_job_id=args.vae_encoder_link_job_id,
                 vae_decoder_link_job_id=args.vae_decoder_link_job_id,
+                unet_profile_job_id=args.unet_profile_job_id,
+                vae_encoder_profile_job_id=args.vae_encoder_profile_job_id,
+                vae_decoder_profile_job_id=args.vae_decoder_profile_job_id,
+                reference_profile_evidence=profile_evidence,
                 consume_source_files=args.consume_source_files,
             )
             print(f"Candidate archive written: {output}")
