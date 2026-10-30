@@ -36,6 +36,13 @@ def collect_compute_units(value: object) -> list[str]:
     return sorted(units)
 
 
+def confirms_npu_only(units: list[str]) -> bool:
+    # Qualcomm AI Hub reports Qualcomm Hexagon execution with compute_unit=NPU.
+    # Require every reported unit to be NPU/HTP so mixed CPU/GPU runs fail closed.
+    normalized = {unit.upper().replace(" ", "").replace("_", "").replace("-", "") for unit in units}
+    return bool(normalized) and normalized.issubset({"NPU", "HTP", "QNNNPU", "QNNHTP"})
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--model-dir", required=True, help="AI Hub .onnx directory with one graph and its external weights")
@@ -96,8 +103,8 @@ def main() -> int:
         name="Illustrious XL v2.0 SDXL U-Net v73 reference dtype-castfix",
         input_specs=input_specs,
         graph_names=["unet"],
-        compile_options=["--qnn_options default_graph_htp_precision=FLOAT16"],
-        link_options="--qnn_options default_graph_htp_optimizations=O=3",
+        compile_options=["--qairt_version 2.51 --qnn_options default_graph_htp_precision=FLOAT16"],
+        link_options="--qairt_version 2.51 --qnn_options default_graph_htp_optimizations=O=3",
         project=args.project,
     )
     result = {
@@ -143,7 +150,7 @@ def main() -> int:
         device=device,
         inputs=profile_inputs,
         name="Illustrious XL v2.0 SDXL U-Net v73 HTP dtype-castfix inference",
-        options="--max_profiler_iterations 1",
+        options="--qairt_version 2.51 --compute_unit npu --max_profiler_iterations 1",
         profile=True,
     )
     result["inference_job_url"] = inference_job.url
@@ -164,7 +171,7 @@ def main() -> int:
         result["profile_keys"] = list(profile_data.keys())
         units = collect_compute_units(profile_data)
         result["profile_compute_units"] = units
-        result["htp_execution_verified"] = any("HTP" in unit.upper() for unit in units)
+        result["htp_execution_verified"] = confirms_npu_only(units)
     logs = output_dir / "inference_logs"
     logs.mkdir(exist_ok=True)
     inference_job.download_job_logs(str(logs))

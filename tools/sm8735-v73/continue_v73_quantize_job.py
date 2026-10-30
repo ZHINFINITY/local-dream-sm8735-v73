@@ -60,6 +60,13 @@ def collect_compute_units(value: object) -> list[str]:
     return sorted(units)
 
 
+def confirms_npu_only(units: list[str]) -> bool:
+    # Qualcomm AI Hub reports Qualcomm Hexagon execution with compute_unit=NPU.
+    # Require every reported unit to be NPU/HTP so mixed CPU/GPU runs fail closed.
+    normalized = {unit.upper().replace(" ", "").replace("_", "").replace("-", "") for unit in units}
+    return bool(normalized) and normalized.issubset({"NPU", "HTP", "QNNNPU", "QNNHTP"})
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--quantize-job-id", required=True)
@@ -68,6 +75,7 @@ def main() -> int:
     parser.add_argument("--output-dir", default="/workspace/sdxl-export/v73-unet-allbiased-allmatmuladd-rescaled-customcal-w8a16")
     parser.add_argument("--wait-timeout", type=int, default=7200)
     parser.add_argument("--poll-seconds", type=int, default=30)
+    parser.add_argument("--download-context", action="store_true", help="Also save unet.bin locally; by default the package builder streams it from AI Hub directly into the ZIP")
     args = parser.parse_args()
 
     api_token = os.environ.get("QAI_HUB_API_TOKEN")
@@ -165,23 +173,30 @@ def main() -> int:
         "text_embeds": ((1, 1280), "float16"),
         "time_ids": ((1, 6), "float16"),
     }]
-    compile_jobs, link_job = client.submit_compile_and_link_jobs(
-        models=[qmodel],
-        device=device,
-        name="Illustrious XL v2 all-biased W8A16 HTP v73 reference",
-        input_specs=input_specs,
-        graph_names=["unet"],
-        compile_options=[],
-        link_options="--qnn_options default_graph_htp_optimizations=O=3",
-        project=args.project,
-    )
-    if not link_job:
-        raise RuntimeError("AI Hub did not return a link job")
+    existing_compile_urls = result.get("compile_job_urls") or []
+    existing_link_url = result.get("link_job_url")
+    if existing_compile_urls and existing_link_url:
+        print("Resuming the compile/link jobs recorded in pipeline.json; no duplicate jobs will be submitted.", flush=True)
+        compile_jobs = [client.get_job(job_id_from_url(url)) for url in existing_compile_urls]
+        link_job = client.get_job(job_id_from_url(existing_link_url))
+    else:
+        compile_jobs, link_job = client.submit_compile_and_link_jobs(
+            models=[qmodel],
+            device=device,
+            name="Illustrious XL v2 all-biased W8A16 HTP v73 reference",
+            input_specs=input_specs,
+            graph_names=["unet"],
+            compile_options=["--qairt_version 2.51"],
+            link_options="--qairt_version 2.51 --qnn_options default_graph_htp_optimizations=O=3",
+            project=args.project,
+        )
+        if not link_job:
+            raise RuntimeError("AI Hub did not return a link job")
+        result["compile_job_urls"] = [job.url for job in compile_jobs]
+        result["link_job_url"] = link_job.url
+        result_path.write_text(json.dumps(result, indent=2) + "\n")
     compile_ids = [job_id_from_url(job.url) for job in compile_jobs]
     link_id = job_id_from_url(link_job.url)
-    result["compile_job_urls"] = [job.url for job in compile_jobs]
-    result["link_job_url"] = link_job.url
-    result_path.write_text(json.dumps(result, indent=2) + "\n")
     compile_states = wait_for_jobs(compile_ids + [link_id], "compile/link")
     result["compile_statuses"] = [compile_states[job_id] for job_id in compile_ids]
     result["link_status"] = compile_states[link_id]
@@ -207,18 +222,23 @@ def main() -> int:
         "text_embeds": [rng.standard_normal((1, 1280)).astype(np.float16)],
         "time_ids": [np.array([[1024, 1024, 0, 0, 1024, 1024]], dtype=np.float16)],
     }
-    inference_job = client.submit_inference_job(
-        model=linked_model,
-        device=device,
-        inputs=profile_inputs,
-        name="Illustrious XL v2 all-biased W8A16 HTP v73 inference",
-        options="--max_profiler_iterations 1",
-        profile=True,
-        project=args.project,
-    )
+    existing_inference_url = result.get("inference_job_url")
+    if existing_inference_url:
+        print("Resuming the inference/profile job recorded in pipeline.json; no duplicate inference will be submitted.", flush=True)
+        inference_job = client.get_job(job_id_from_url(existing_inference_url))
+    else:
+        inference_job = client.submit_inference_job(
+            model=linked_model,
+            device=device,
+            inputs=profile_inputs,
+            name="Illustrious XL v2 all-biased W8A16 HTP v73 inference",
+            options="--qairt_version 2.51 --compute_unit npu --max_profiler_iterations 1",
+            profile=True,
+            project=args.project,
+        )
+        result["inference_job_url"] = inference_job.url
+        result_path.write_text(json.dumps(result, indent=2) + "\n")
     inference_id = job_id_from_url(inference_job.url)
-    result["inference_job_url"] = inference_job.url
-    result_path.write_text(json.dumps(result, indent=2) + "\n")
     inference_states = wait_for_jobs([inference_id], "inference")
     result["inference_status"] = inference_states[inference_id]
     if result["inference_status"] != TERMINAL_SUCCESS:
@@ -245,7 +265,7 @@ def main() -> int:
             units = collect_compute_units(profile_data)
             result["profile_path"] = str(profile_path)
             result["profile_compute_units"] = units
-            result["htp_execution_verified"] = any("HTP" in unit.upper() for unit in units)
+            result["htp_execution_verified"] = confirms_npu_only(units)
     except Exception as exc:
         result["profile_download_error"] = f"{type(exc).__name__}: {exc}"
     logs = output_dir / "inference_logs"
@@ -254,11 +274,25 @@ def main() -> int:
         inference_job.download_job_logs(str(logs))
     except Exception as exc:
         result["inference_log_download_error"] = f"{type(exc).__name__}: {exc}"
+    if not result.get("htp_execution_verified", False):
+        result_path.write_text(json.dumps(result, indent=2) + "\n")
+        raise RuntimeError("Inference succeeded but the downloaded profile did not confirm HTP compute-unit execution")
+    if args.download_context:
+        context_path = output_dir / "unet.bin"
+        if context_path.is_file() and context_path.stat().st_size > 0:
+            downloaded_context = context_path
+        else:
+            downloaded = link_job.download_target_model(filename=str(context_path))
+            downloaded_context = Path(downloaded) if isinstance(downloaded, (str, Path)) else context_path
+        if not downloaded_context.is_file():
+            raise RuntimeError(f"AI Hub reported NPU execution but the linked context download is missing: {downloaded_context}")
+        result["context_download_path"] = str(downloaded_context)
+        result["context_size_bytes"] = downloaded_context.stat().st_size
+    else:
+        result["context_download_skipped_for_streaming"] = True
     result_path.write_text(json.dumps(result, indent=2) + "\n")
     print("FINAL_RESULT", json.dumps(result, indent=2), flush=True)
-    if not result.get("htp_execution_verified", False):
-        raise RuntimeError("Inference succeeded but the downloaded profile did not confirm HTP compute-unit execution")
-    print("HTP execution verified on the Samsung Galaxy S23 / SM8550 v73 reference only.", flush=True)
+    print("NPU-only execution verified on the Samsung Galaxy S23 / SM8550 v73 reference only.", flush=True)
     return 0
 
 

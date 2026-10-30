@@ -4,9 +4,11 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import pathlib
 import re
+import shutil
 import zipfile
 from typing import Any
 
@@ -14,7 +16,9 @@ REQUIRED_FILES = {
     "SDXL",
     "tokenizer.json",
     "clip.mnn",
+    "clip.mnn.weight",
     "clip_2.mnn",
+    "clip_2.mnn.weight",
     "pos_emb.bin",
     "token_emb.bin",
     "pos_emb_2.bin",
@@ -24,6 +28,8 @@ REQUIRED_FILES = {
     "vae_decoder.bin",
 }
 PACKAGE_PREFIX = pathlib.PurePosixPath("output/qnn_models_sdxl_8gen2")
+SOURCE_REPO = "NyuromonX/Illustrious-XL-v2.0-Diffusers-fp16"
+SOURCE_REVISION = "c3cd0edb4c4ebfc6c86011039fb2e81b865b5d85"
 
 
 def _replace_single_line(
@@ -120,6 +126,15 @@ def package_candidate(
     package_dir: pathlib.Path,
     output_path: pathlib.Path,
     soc_model: int,
+    *,
+    unet_htp_profiled_sm8550: bool = False,
+    vae_encoder_htp_profiled_sm8550: bool = False,
+    vae_decoder_htp_profiled_sm8550: bool = False,
+    unet_context_bytes: bytes | None = None,
+    unet_link_job_id: str | None = None,
+    vae_encoder_link_job_id: str | None = None,
+    vae_decoder_link_job_id: str | None = None,
+    consume_source_files: bool = False,
 ) -> pathlib.Path:
     """Validate expected app files and package them with an explicit test-only note."""
     package_dir = package_dir.resolve()
@@ -127,28 +142,78 @@ def package_candidate(
     if not package_dir.is_dir():
         raise FileNotFoundError(f"Package directory not found: {package_dir}")
     found = {item.name for item in package_dir.iterdir() if item.is_file()}
+    if unet_context_bytes is not None:
+        if not unet_context_bytes:
+            raise ValueError("AI Hub returned an empty U-Net context")
+        if "unet.bin" in found:
+            raise ValueError("Provide the U-Net context either from AI Hub memory or from package_dir, not both")
+        found.add("unet.bin")
     missing = sorted(REQUIRED_FILES - found)
     if missing:
         raise ValueError("Incomplete Local Dream SDXL package; missing: " + ", ".join(missing))
 
+    components_profiled = {
+        "unet_htp_profiled_on_sm8550": bool(unet_htp_profiled_sm8550),
+        "vae_encoder_htp_profiled_on_sm8550": bool(vae_encoder_htp_profiled_sm8550),
+        "vae_decoder_htp_profiled_on_sm8550": bool(vae_decoder_htp_profiled_sm8550),
+    }
+    all_components_profiled = all(components_profiled.values()) and int(soc_model) == 43
     profile: dict[str, Any] = {
-        "status": "EXPERIMENTAL_UNVALIDATED",
+        "status": "COMPONENTS_PROFILED_SM8550_ONLY" if all_components_profiled else "EXPERIMENTAL_UNVALIDATED",
         "model_type": "SDXL",
         "htp_arch": "v73",
         "vtcm_mb": 8,
         "qnn_soc_model": int(soc_model),
+        "source_repo": SOURCE_REPO,
+        "source_revision": SOURCE_REVISION,
+        "source_identity_note": "The mirror is name-matched to Illustrious XL v2.0, but exact weight identity with the upstream OnomaAIResearch checkpoint is not independently verified.",
+        "qairt_version": "2.51",
+        "component_precision": {"unet": "W8A16", "vae_encoder": "HTP FP16", "vae_decoder": "HTP FP16", "clip_encoders": "MNN assets from the published Onoma-based conversion"},
         "target_note": (
             "Qualcomm SM8550 reference profile; not an SM8735-specific target."
             if int(soc_model) == 43
             else "Caller-supplied SoC model value; verify against Qualcomm documentation."
         ),
-        "validation": "Not validated on POCO F7 / SM8735. Do not infer support from the v73 architecture alone.",
+        "sm8550_reference_component_profiles": components_profiled,
+        "sm8550_reference_job_ids": {
+            "unet_link_job_id": unet_link_job_id,
+            "vae_encoder_link_job_id": vae_encoder_link_job_id,
+            "vae_decoder_link_job_id": vae_decoder_link_job_id,
+        },
+        "unet_context_sha256": hashlib.sha256(unet_context_bytes).hexdigest() if unet_context_bytes is not None else None,
+        "sm8735_poco_f7_validated": False,
+        "model_capabilities": {
+            "text_to_image": True,
+            "image_to_image": "vae_encoder.bin" in found,
+        },
+        "validation": (
+            "The U-Net and both VAE contexts have separate HTP profiles on the SM8550 reference; the integrated app package and POCO F7 / SM8735 are not device-validated."
+            if all_components_profiled
+            else "Not validated on POCO F7 / SM8735. Do not infer support from an SM8550 v73 reference profile or the v73 architecture alone."
+        ),
     }
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    with zipfile.ZipFile(output_path, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=1) as archive:
+    with zipfile.ZipFile(output_path, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=1, allowZip64=True) as archive:
         for item in sorted(package_dir.rglob("*")):
-            if item.is_file() and item.name != "EXPERIMENTAL_V73_UNVALIDATED.json":
-                archive.write(item, str(PACKAGE_PREFIX / item.relative_to(package_dir)))
+            if not item.is_file() or item.name == "EXPERIMENTAL_V73_UNVALIDATED.json":
+                continue
+            if unet_context_bytes is not None and item.relative_to(package_dir).as_posix() == "unet.bin":
+                continue
+            archive_info = zipfile.ZipInfo(str(PACKAGE_PREFIX / item.relative_to(package_dir)))
+            archive_info.compress_type = zipfile.ZIP_DEFLATED
+            with item.open("rb") as source, archive.open(archive_info, "w", force_zip64=True) as destination:
+                shutil.copyfileobj(source, destination, length=8 * 1024 * 1024)
+            if consume_source_files:
+                item.unlink()
+        if unet_context_bytes is not None:
+            archive_info = zipfile.ZipInfo(str(PACKAGE_PREFIX / "unet.bin"))
+            archive_info.compress_type = zipfile.ZIP_DEFLATED
+            with archive.open(archive_info, "w", force_zip64=True) as destination:
+                view = memoryview(unet_context_bytes)
+                chunk_size = 64 * 1024 * 1024
+                for offset in range(0, len(view), chunk_size):
+                    destination.write(view[offset : offset + chunk_size])
+            del view
         archive.writestr(
             str(PACKAGE_PREFIX / "EXPERIMENTAL_V73_UNVALIDATED.json"),
             json.dumps(profile, indent=2) + "\n",
@@ -176,6 +241,14 @@ def main() -> None:
     package_parser.add_argument("--package-dir", type=pathlib.Path, required=True)
     package_parser.add_argument("--output", type=pathlib.Path, required=True)
     package_parser.add_argument("--soc-model", type=int, required=True)
+    package_parser.add_argument("--unet-htp-profiled-sm8550", action="store_true")
+    package_parser.add_argument("--vae-encoder-htp-profiled-sm8550", action="store_true")
+    package_parser.add_argument("--vae-decoder-htp-profiled-sm8550", action="store_true")
+    package_parser.add_argument("--unet-link-job-id", help="Download the completed LinkJob context directly into the ZIP in memory")
+    package_parser.add_argument("--vae-encoder-link-job-id")
+    package_parser.add_argument("--vae-decoder-link-job-id")
+    package_parser.add_argument("--project")
+    package_parser.add_argument("--consume-source-files", action="store_true", help="Delete local package files after each is written to the ZIP")
 
     args = parser.parse_args()
     try:
@@ -183,7 +256,37 @@ def main() -> None:
             prepare_v73_profile(args.converter_root, args.soc_model)
             print(f"Prepared HTP v73 / 8 MB profile under {args.converter_root}")
         else:
-            output = package_candidate(args.package_dir, args.output, args.soc_model)
+            unet_context_bytes = None
+            if args.unet_link_job_id:
+                import os
+                import qai_hub as hub
+
+                api_token = os.environ.get("QAI_HUB_API_TOKEN")
+                if not api_token:
+                    raise ValueError("QAI_HUB_API_TOKEN must be set when --unet-link-job-id is used")
+                client = hub.Client(config=hub.ClientConfig(api_token=api_token, default_project=args.project))
+                link_job = client.get_job(args.unet_link_job_id)
+                link_status = str(link_job.get_status()).upper()
+                if "DONE" not in link_status and "SUCCESS" not in link_status:
+                    raise ValueError(f"U-Net link job {args.unet_link_job_id} is not complete: {link_status}")
+                print(f"Downloading linked U-Net context {args.unet_link_job_id} into memory for ZIP packaging", flush=True)
+                unet_context_bytes = link_job.download_target_model()
+                if not isinstance(unet_context_bytes, bytes):
+                    raise TypeError(f"Expected in-memory U-Net bytes from AI Hub, got {type(unet_context_bytes).__name__}")
+                print(f"Loaded U-Net context in memory: {len(unet_context_bytes)} bytes", flush=True)
+            output = package_candidate(
+                args.package_dir,
+                args.output,
+                args.soc_model,
+                unet_htp_profiled_sm8550=args.unet_htp_profiled_sm8550,
+                vae_encoder_htp_profiled_sm8550=args.vae_encoder_htp_profiled_sm8550,
+                vae_decoder_htp_profiled_sm8550=args.vae_decoder_htp_profiled_sm8550,
+                unet_context_bytes=unet_context_bytes,
+                unet_link_job_id=args.unet_link_job_id,
+                vae_encoder_link_job_id=args.vae_encoder_link_job_id,
+                vae_decoder_link_job_id=args.vae_decoder_link_job_id,
+                consume_source_files=args.consume_source_files,
+            )
             print(f"Candidate archive written: {output}")
     except (FileNotFoundError, ValueError) as error:
         parser.error(str(error))

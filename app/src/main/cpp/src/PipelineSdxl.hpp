@@ -344,7 +344,7 @@ class PipelineSdxl : public PipelineQnn {
       clip2_session_ = createMnnSession(clip2_interpreter_, opts);
       if (!clip2_session_)
         throw std::runtime_error("Failed create SDXL CLIP2 session");
-      auto in2 = clip2_interpreter_->getSessionInput(clip2_session_,
+    auto in2 = clip2_interpreter_->getSessionInput(clip2_session_,
                                                      "input_embedding");
       clip2_interpreter_->resizeTensor(in2, {1, 77, text_embedding_size_2});
       clip2_interpreter_->resizeSession(clip2_session_);
@@ -383,11 +383,11 @@ class PipelineSdxl : public PipelineQnn {
     QNN_INFO("[lowram] SDXL VAE Encoder released");
   }
 
-  // Encoder 1 (CLIP-L): 77x768 -> last_hidden_state 77x768.
-  // Encoder 2 (CLIP-G): 77x1280 -> last_hidden_state 77x1280 + pooled_output
-  // 77x1280 (exported without pooling; we select the EOS row here as the true
-  // pooled embedding). Hidden states are concatenated along the feature dim:
-  // [77, 768] + [77, 1280] = [77, 2048].
+  // Encoder 1 (CLIP-L): 77x768 -> last_hidden_state 77x768. Encoder 2
+  // (CLIP-G): 77x1280 -> last_hidden_state 77x1280 plus either a per-token
+  // pooled_output (select its EOS row here) or an already selected/projected
+  // text_embeds vector from an export that accepts eos_index. Hidden states are
+  // concatenated along the feature dim: [77, 768] + [77, 1280] = [77, 2048].
   void runDualClip(const float *emb1,
                    const float *emb2, int eos_pos,
                    float *out_hidden_concat, float *out_pooled) {
@@ -406,13 +406,19 @@ class PipelineSdxl : public PipelineQnn {
         clip2_interpreter_->getSessionInput(clip2_session_, "input_embedding");
     memcpy(in2->host<float>(), emb2,
            77 * text_embedding_size_2 * sizeof(float));
+    // Some SDXL MNN CLIP-G exports compute the projected pooled embedding in
+    // the graph and therefore require the EOS position as a second input.
+    // Older Local Dream exports instead expose a per-token pooled_output and
+    // leave EOS selection to this runner.
+    auto eos_index_input =
+        clip2_interpreter_->getSessionInput(clip2_session_, "eos_index");
+    if (eos_index_input) eos_index_input->host<int32_t>()[0] = eos_pos;
     clip2_interpreter_->runSession(clip2_session_);
     auto out2_hidden = clip2_interpreter_->getSessionOutput(
         clip2_session_, "last_hidden_state");
-    auto out2_pool =
-        clip2_interpreter_->getSessionOutput(clip2_session_, "pooled_output");
+    if (!out2_hidden)
+      throw std::runtime_error("SDXL CLIP2 missing last_hidden_state output");
     const float *out2_hidden_data = out2_hidden->host<float>();
-    const float *out2_pool_data = out2_pool->host<float>();
 
     for (int t = 0; t < 77; t++) {
       memcpy(out_hidden_concat + t * concat_dim,
@@ -422,9 +428,26 @@ class PipelineSdxl : public PipelineQnn {
              out2_hidden_data + t * text_embedding_size_2,
              text_embedding_size_2 * sizeof(float));
     }
-    // Use the true EOS row; textual-inversion slots also carry ID 49407.
-    memcpy(out_pooled, out2_pool_data + eos_pos * text_embedding_size_2,
-           text_embedding_size_2 * sizeof(float));
+
+    auto out2_pool =
+        clip2_interpreter_->getSessionOutput(clip2_session_, "pooled_output");
+    if (out2_pool) {
+      // Older Local Dream exports expose a per-token pooled_output; use the
+      // true EOS row because textual-inversion slots can also carry ID 49407.
+      const float *out2_pool_data = out2_pool->host<float>();
+      memcpy(out_pooled, out2_pool_data + eos_pos * text_embedding_size_2,
+             text_embedding_size_2 * sizeof(float));
+    } else {
+      // The published Mouserat/Nezumi CLIP-G graph accepts eos_index and
+      // returns text_embeds [1,1280], already EOS-selected and projected.
+      auto out2_text_embeds =
+          clip2_interpreter_->getSessionOutput(clip2_session_, "text_embeds");
+      if (!out2_text_embeds)
+        throw std::runtime_error(
+            "SDXL CLIP2 missing pooled_output and text_embeds outputs");
+      memcpy(out_pooled, out2_text_embeds->host<float>(),
+             text_embedding_size_2 * sizeof(float));
+    }
   }
 
   const std::string clip_path_;
