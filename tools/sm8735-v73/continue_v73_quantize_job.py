@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
-"""Resume an existing AI Hub W8A16 job, then compile/link/profile on v73.
+"""Resume an existing AI Hub quantization job, then compile/link/profile on v73.
 
-The Samsung Galaxy S23 is an SM8550 / HTP-v73 reference target only; this
+The model-variant label and output directory should be unique per quantization
+job. The Samsung Galaxy S23 is an SM8550 / HTP-v73 reference target only; this
 script does not establish compatibility with the POCO F7 / SM8735.
 """
 from __future__ import annotations
@@ -73,6 +74,26 @@ def htp_options_for_level(level: int) -> list[str]:
     return [f"--qairt_version 2.51 --qnn_options default_graph_htp_optimizations=O={level}"]
 
 
+def compile_job_name(model_variant: str, level: int) -> str:
+    return f"Illustrious XL v2 all-biased {model_variant} HTP v73 HTP-opt-L{level}"
+
+
+def inference_job_name(model_variant: str) -> str:
+    return f"Illustrious XL v2 all-biased {model_variant} HTP v73 inference"
+
+
+def validate_pipeline_identity(result: dict[str, Any], model_variant: str, level: int) -> None:
+    recorded_variant = result.get("model_variant")
+    has_existing_jobs = any(result.get(key) for key in ("compile_job_urls", "link_job_url", "inference_job_url"))
+    if recorded_variant and recorded_variant != model_variant:
+        raise ValueError(f"Pipeline is already bound to model variant {recorded_variant!r}, not {model_variant!r}")
+    if has_existing_jobs and not recorded_variant and model_variant != "W8A16":
+        raise ValueError("Legacy pipeline has job IDs but no variant label; only W8A16 can safely resume it")
+    recorded_level = result.get("htp_finalize_optimization_level")
+    if recorded_level is not None and recorded_level != level:
+        raise ValueError(f"Pipeline is already bound to HTP optimization level {recorded_level}, not {level}")
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--quantize-job-id", required=True)
@@ -82,6 +103,7 @@ def main() -> int:
     parser.add_argument("--wait-timeout", type=int, default=7200)
     parser.add_argument("--poll-seconds", type=int, default=30)
     parser.add_argument("--htp-finalize-optimization-level", type=int, choices=(1, 2, 3), default=3)
+    parser.add_argument("--model-variant", default="W8A16", help="Label used in AI Hub job names and pipeline metadata")
     parser.add_argument("--download-context", action="store_true", help="Also save unet.bin locally; by default the package builder streams it from AI Hub directly into the ZIP")
     args = parser.parse_args()
 
@@ -95,10 +117,15 @@ def main() -> int:
     output_dir.mkdir(parents=True, exist_ok=True)
     result_path = output_dir / "pipeline.json"
     result: dict[str, Any] = json.loads(result_path.read_text()) if result_path.exists() else {}
+    try:
+        validate_pipeline_identity(result, args.model_variant, args.htp_finalize_optimization_level)
+    except ValueError as exc:
+        parser.error(str(exc))
     result.update({
         "quantize_job_id": args.quantize_job_id,
         "quantize_job_url": f"https://workbench.aihub.qualcomm.com/jobs/{args.quantize_job_id}/",
         "device": args.device,
+        "model_variant": args.model_variant,
         "target_claim": "SM8550 / HTP v73 reference only; not SM8735/POCO F7 validation",
         "input_contract": {
             "sample": [1, 4, 128, 128],
@@ -125,6 +152,7 @@ def main() -> int:
         pending = set(job_ids)
         statuses: dict[str, str] = {}
         last_printed: dict[str, str] = {}
+        last_heartbeat = time.monotonic()
         deadline = time.monotonic() + args.wait_timeout
         while pending and time.monotonic() < deadline:
             for job_id in list(pending):
@@ -140,6 +168,11 @@ def main() -> int:
                 except Exception as exc:
                     print(f"STATUS_RETRY {label} {job_id}: {type(exc).__name__}: {exc}", flush=True)
             if pending:
+                now = time.monotonic()
+                if now - last_heartbeat >= 300:
+                    detail = ", ".join(f"{job_id}:{statuses.get(job_id, 'pending')}" for job_id in sorted(pending))
+                    print(f"{label} still waiting: {detail}", flush=True)
+                    last_heartbeat = now
                 time.sleep(max(1, args.poll_seconds))
         if pending:
             raise TimeoutError(f"Timed out waiting for {label}: {sorted(pending)}")
@@ -192,7 +225,7 @@ def main() -> int:
         compile_jobs, link_job = client.submit_compile_and_link_jobs(
             models=[qmodel],
             device=device,
-            name=f"Illustrious XL v2 all-biased W8A16 HTP v73 HTP-opt-L{args.htp_finalize_optimization_level}",
+            name=compile_job_name(args.model_variant, args.htp_finalize_optimization_level),
             input_specs=input_specs,
             graph_names=["unet"],
             compile_options=compile_options,
@@ -243,7 +276,7 @@ def main() -> int:
             model=linked_model,
             device=device,
             inputs=profile_inputs,
-            name="Illustrious XL v2 all-biased W8A16 HTP v73 inference",
+            name=inference_job_name(args.model_variant),
             options="--qairt_version 2.51 --compute_unit npu --max_profiler_iterations 1",
             profile=True,
             project=args.project,
