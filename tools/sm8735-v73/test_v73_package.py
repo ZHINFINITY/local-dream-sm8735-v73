@@ -5,10 +5,25 @@ import tempfile
 import unittest
 import zipfile
 
-from build_v73_package import PACKAGE_PREFIX, REQUIRED_FILES, package_candidate, prepare_v73_profile
+from build_v73_package import (
+    PACKAGE_PREFIX,
+    REQUIRED_FILES,
+    _link_job_matches_compile_id,
+    package_candidate,
+    prepare_v73_profile,
+)
 
 
 class V73ProfileTests(unittest.TestCase):
+    def test_link_job_must_reference_the_declared_compile_job(self):
+        matching = type("Model", (), {"name": "job_compile123_optimized_dlc"})()
+        unrelated = type("Model", (), {"name": "job_other456_optimized_dlc"})()
+        link_job = type("LinkJob", (), {"models": [matching]})()
+
+        self.assertTrue(_link_job_matches_compile_id(link_job, "compile123"))
+        link_job.models = [unrelated]
+        self.assertFalse(_link_job_matches_compile_id(link_job, "compile123"))
+
     def test_profile_targets_v73_with_8mb_vtcm_and_sm8550_reference_id(self):
         with tempfile.TemporaryDirectory() as temp:
             root = pathlib.Path(temp)
@@ -86,8 +101,28 @@ class V73ProfileTests(unittest.TestCase):
                     unet_htp_profiled_sm8550=True,
                     vae_encoder_htp_profiled_sm8550=True,
                     vae_decoder_htp_profiled_sm8550=True,
+                    unet_compile_job_id="unet-compile",
+                    vae_encoder_compile_job_id="encoder-compile",
+                    vae_decoder_compile_job_id="decoder-compile",
                     unet_link_job_id="unet-link",
                     vae_encoder_link_job_id="encoder-link",
+                )
+
+    def test_profile_claim_requires_source_compile_job_id(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = pathlib.Path(temp)
+            package_dir = root / "model"
+            package_dir.mkdir()
+            for name in REQUIRED_FILES:
+                (package_dir / name).write_bytes(b"")
+
+            with self.assertRaisesRegex(ValueError, "requires its source compile job ID"):
+                package_candidate(
+                    package_dir,
+                    root / "candidate.zip",
+                    43,
+                    unet_htp_profiled_sm8550=True,
+                    unet_link_job_id="unet-link",
                 )
 
     def test_package_streams_unet_context_from_memory(self):
@@ -191,6 +226,9 @@ class V73ProfileTests(unittest.TestCase):
                 unet_htp_profiled_sm8550=True,
                 vae_encoder_htp_profiled_sm8550=True,
                 vae_decoder_htp_profiled_sm8550=True,
+                unet_compile_job_id="unet-compile",
+                vae_encoder_compile_job_id="encoder-compile",
+                vae_decoder_compile_job_id="decoder-compile",
                 unet_link_job_id="unet-link",
                 vae_encoder_link_job_id="encoder-link",
                 vae_decoder_link_job_id="decoder-link",
@@ -204,6 +242,10 @@ class V73ProfileTests(unittest.TestCase):
             self.assertTrue(metadata["sm8550_reference_component_profiles"]["vae_decoder_htp_profiled_on_sm8550"])
             self.assertFalse(metadata["sm8735_poco_f7_validated"])
             self.assertIn("not device-validated", metadata["validation"])
+            self.assertEqual(
+                metadata["sm8550_reference_job_ids"]["unet_compile_job_id"],
+                "unet-compile",
+            )
 
 
 if __name__ == "__main__":

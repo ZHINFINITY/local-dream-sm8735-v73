@@ -28,15 +28,18 @@ The VAE components are exported with `export_illustrious_vae_encoder_onnx.py` an
 
 `build_android_v73_candidate.sh` is the APK workflow. It expects a preinstalled Android SDK/NDK whose terms are already accepted, plus `QNN_SDK_ROOT` pointing to the QAIRT subset. It builds for `arm64-v8a` and HTP v73, adds the NDK `libc++_shared.so` and Qualcomm notices to the staged runtime, and emits a side-by-side-installable debug APK. It does not download SDKs, accept terms, or push SDK binaries to GitHub.
 
-Once all three reference profiles have confirmed HTP, the package builder checks that each supplied U-Net/VAE job is a successful AI Hub `LinkJob` on the expected Samsung Galaxy S23 reference and that it produced a linked target model. It fetches the U-Net context into memory, then writes it to the ZIP in bounded chunks (no second multi-gigabyte disk copy). A profile claim also requires that component’s link-job ID. The builder does not independently retrieve inference reports, so profile flags remain caller assertions and must only be supplied after checking the recorded HTP report. It writes a temporary ZIP outside the model folder, checks staged MNN companion hashes against `MNN_COMPANIONS_SOURCE.json`, verifies the content manifest and reads every ZIP member through CRC/hash validation, then atomically publishes the final ZIP. Example command (replace the job IDs with the successful recorded IDs; pass each `--*-htp-profiled-sm8550` flag only after that component’s profile explicitly confirms HTP):
+Once all three reference profiles have confirmed HTP, the package builder checks that each supplied compile job is a successful AI Hub `CompileJob`, each context job is a successful `LinkJob` on the expected Samsung Galaxy S23 reference, and the linked model names match their declared compile-job IDs. It also requires each link job to produce a target model. It fetches the U-Net context into memory, then writes it to the ZIP in bounded chunks (no second multi-gigabyte disk copy). A profile claim requires both that component’s compile-job ID and link-job ID. The builder does not independently retrieve inference reports, so profile flags remain caller assertions and must only be supplied after checking the recorded HTP report. It writes a temporary ZIP outside the model folder, checks staged MNN companion hashes against `MNN_COMPANIONS_SOURCE.json`, verifies the content manifest and reads every ZIP member through CRC/hash validation, then atomically publishes the final ZIP. Example command (replace the job IDs with the successful recorded IDs; pass each `--*-htp-profiled-sm8550` flag only after that component’s profile explicitly confirms HTP):
 
 ```bash
 QAI_HUB_API_TOKEN=... python3 tools/sm8735-v73/build_v73_package.py package \
   --package-dir /path/to/local-dream-model \
   --output /path/to/illustrious_xl_v2_experimental_v73_soc43_candidate.zip \
   --soc-model 43 --project <ai-hub-project-id> \
+  --unet-compile-job-id <successful-unet-compile-job-id> \
   --unet-link-job-id <successful-unet-link-job-id> \
+  --vae-encoder-compile-job-id <successful-encoder-compile-job-id> \
   --vae-encoder-link-job-id <successful-encoder-link-job-id> \
+  --vae-decoder-compile-job-id <successful-decoder-compile-job-id> \
   --vae-decoder-link-job-id <successful-decoder-link-job-id> \
   --unet-htp-profiled-sm8550 \
   --vae-encoder-htp-profiled-sm8550 \
