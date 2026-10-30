@@ -4,7 +4,7 @@
 
 ## Current state
 
-The Illustrious-name-matched SDXL U-Net was exported to ONNX at the static 128×128 latent size (1024×1024 output equivalent). The graph was adjusted for AI Hub’s FP16 scale-floor constraint and the custom W8A16 quantization job `jpy2qd6rg` completed successfully. The first v73 reference compile (`jp1178qlp`) failed at the AI Hub compilation time limit with context optimization level 3; its log reached 40 GiB worker memory during ONNX-to-QNN-DLC conversion. The dependent link (`jgd48v7lg`) failed, and no U-Net HTP inference/profile ran. AI Hub recommends `--qnn_context_binary_optimization_level 1` for a lower-time compile, at the cost of less optimal inference performance. Calibration used only three synthetic diagnostic tensors, so the model is not accuracy-validated; a successful NPU profile would prove execution, not image quality.
+The Illustrious-name-matched SDXL U-Net was exported to ONNX at the static 128×128 latent size (1024×1024 output equivalent). The graph was adjusted for AI Hub’s FP16 scale-floor constraint and the custom W8A16 quantization job `jpy2qd6rg` completed successfully. The first v73 reference compile (`jp1178qlp`) failed at the AI Hub compilation time limit with context optimization level 3; its log reached 40 GiB worker memory during ONNX-to-QNN-DLC conversion. The dependent link (`jgd48v7lg`) failed, and no U-Net HTP inference/profile ran. AI Hub’s failure message suggested the low-level `--qnn_context_binary_optimization_level 1` flag, but the public submission API rejected it before creating a retry job. Qualcomm’s [AI Hub API documentation](https://workbench.aihub.qualcomm.com/docs/hub/api.html) instead documents `--qnn_options default_graph_htp_optimizations=O=1` as a supported faster-preparation setting that may produce a less-optimal graph; this is the supported retry path. Calibration used only three synthetic diagnostic tensors, so the model is not accuracy-validated; a successful NPU profile would prove execution, not image quality.
 
 Matching VAE decoder and encoder ONNX graphs were also exported from the same pinned Diffusers mirror and passed full ONNX validation. On the SM8550 Galaxy S23 v73 reference, decoder compile/link/profile succeeded (`jp37xmxzg`, `jgowovodp`, `jp8r6748g`) and all 161 profile entries reported `compute_unit=NPU`; encoder compile/link/profile succeeded (`jp11787lp`, `jgd48v8lg`, `jgk0oy9o5`) and all 128 entries reported `compute_unit=NPU`. Their linked context binaries were downloaded (decoder 165,076,992 bytes; encoder 103,813,120 bytes). This is NPU execution on the reference, not SM8735/POCO F7 validation.
 
@@ -20,14 +20,14 @@ Local Dream’s SDXL text-encoder companions come from the pinned [Mouserat MNN 
 
 ## Reproducible component flow
 
-`export_illustrious_unet_onnx_dynamo.py` exports the SDXL U-Net. `rescale_fp16_biased_ops.py` adjusts direct biased ops and fusable MatMul-plus-Add pairs to address AI Hub W8A16’s FP16 activation-scale floor. `continue_v73_quantize_job.py` reuses recorded job IDs and does not duplicate compile, link, or inference work. To retry a terminal compile timeout without overwriting the failed O3 record, use a new output directory and AI Hub’s recommended context optimization level 1; the script will compile/link, then profile only after successful linking:
+`export_illustrious_unet_onnx_dynamo.py` exports the SDXL U-Net. `rescale_fp16_biased_ops.py` adjusts direct biased ops and fusable MatMul-plus-Add pairs to address AI Hub W8A16’s FP16 activation-scale floor. `continue_v73_quantize_job.py` reuses recorded job IDs and does not duplicate compile, link, or inference work. To retry a terminal compile timeout without overwriting the failed O3 record, use a new output directory and `--htp-finalize-optimization-level 1`; the script passes AI Hub’s documented `--qnn_options default_graph_htp_optimizations=O=1` to both compile and link, then profiles only after successful linking:
 
 ```bash
 QAI_HUB_API_TOKEN=... python3 tools/sm8735-v73/continue_v73_quantize_job.py \
   --quantize-job-id jpy2qd6rg --project <ai-hub-project-id> \
   --device 'Samsung Galaxy S23' \
   --output-dir /path/to/v73-unet-context-opt-1 \
-  --qnn-context-binary-optimization-level 1 --wait-timeout 86400
+  --htp-finalize-optimization-level 1 --wait-timeout 86400
 ```
 
 The VAE components are exported with `export_illustrious_vae_encoder_onnx.py` and `export_illustrious_vae_decoder_onnx.py`. `compile_profile_v73_vae_encoder.py` and `compile_profile_v73_vae_decoder.py` pin QAIRT 2.51, explicitly request NPU compile/inference, wait for successful linking, require all profile compute-unit labels to be NPU/HTP, and only then download a context binary. AI Hub’s Qualcomm reference profile labels HTP placement as `NPU`. The encoder’s graph contract is one `[1,3,1024,1024]` input and outputs ordered as mean then standard deviation, each `[1,4,128,128]`, matching Local Dream’s positional QNN binding.

@@ -67,10 +67,10 @@ def confirms_npu_only(units: list[str]) -> bool:
     return bool(normalized) and normalized.issubset({"NPU", "HTP", "QNNNPU", "QNNHTP"})
 
 
-def compile_options_for_level(level: int) -> list[str]:
+def htp_options_for_level(level: int) -> list[str]:
     if level not in (1, 2, 3):
-        raise ValueError("QNN context binary optimization level must be 1, 2, or 3")
-    return [f"--qairt_version 2.51 --qnn_context_binary_optimization_level {level}"]
+        raise ValueError("HTP finalize optimization level must be 1, 2, or 3")
+    return [f"--qairt_version 2.51 --qnn_options default_graph_htp_optimizations=O={level}"]
 
 
 def main() -> int:
@@ -81,7 +81,7 @@ def main() -> int:
     parser.add_argument("--output-dir", default="/workspace/sdxl-export/v73-unet-allbiased-allmatmuladd-rescaled-customcal-w8a16")
     parser.add_argument("--wait-timeout", type=int, default=7200)
     parser.add_argument("--poll-seconds", type=int, default=30)
-    parser.add_argument("--qnn-context-binary-optimization-level", type=int, choices=(1, 2, 3), default=3)
+    parser.add_argument("--htp-finalize-optimization-level", type=int, choices=(1, 2, 3), default=3)
     parser.add_argument("--download-context", action="store_true", help="Also save unet.bin locally; by default the package builder streams it from AI Hub directly into the ZIP")
     args = parser.parse_args()
 
@@ -187,12 +187,12 @@ def main() -> int:
         compile_jobs = [client.get_job(job_id_from_url(url)) for url in existing_compile_urls]
         link_job = client.get_job(job_id_from_url(existing_link_url))
     else:
-        compile_options = compile_options_for_level(args.qnn_context_binary_optimization_level)
-        link_options = "--qairt_version 2.51 --qnn_options default_graph_htp_optimizations=O=3"
+        compile_options = htp_options_for_level(args.htp_finalize_optimization_level)
+        link_options = compile_options[0]
         compile_jobs, link_job = client.submit_compile_and_link_jobs(
             models=[qmodel],
             device=device,
-            name=f"Illustrious XL v2 all-biased W8A16 HTP v73 context-opt-L{args.qnn_context_binary_optimization_level}",
+            name=f"Illustrious XL v2 all-biased W8A16 HTP v73 HTP-opt-L{args.htp_finalize_optimization_level}",
             input_specs=input_specs,
             graph_names=["unet"],
             compile_options=compile_options,
@@ -203,7 +203,7 @@ def main() -> int:
             raise RuntimeError("AI Hub did not return a link job")
         result["compile_job_urls"] = [job.url for job in compile_jobs]
         result["link_job_url"] = link_job.url
-        result["qnn_context_binary_optimization_level"] = args.qnn_context_binary_optimization_level
+        result["htp_finalize_optimization_level"] = args.htp_finalize_optimization_level
         result["compile_options"] = compile_options[0]
         result["link_options"] = link_options
         result_path.write_text(json.dumps(result, indent=2) + "\n")
