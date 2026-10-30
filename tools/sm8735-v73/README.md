@@ -4,7 +4,7 @@
 
 ## Current state
 
-The Illustrious-name-matched SDXL U-Net was exported to ONNX at the static 128×128 latent size (1024×1024 output equivalent). The graph was adjusted for AI Hub’s FP16 scale-floor constraint and the custom W8A16 quantization job `jpy2qd6rg` completed successfully. Its reference-device QNN compile/link is still in progress; no successful U-Net HTP inference has yet been confirmed.
+The Illustrious-name-matched SDXL U-Net was exported to ONNX at the static 128×128 latent size (1024×1024 output equivalent). The graph was adjusted for AI Hub’s FP16 scale-floor constraint and the custom W8A16 quantization job `jpy2qd6rg` completed successfully. Calibration used only three synthetic diagnostic tensors, so this is not accuracy-validated and a successful NPU profile would prove execution, not image quality. Its reference-device QNN compile/link is still in progress; no successful U-Net HTP inference has yet been confirmed.
 
 Matching VAE decoder and encoder ONNX graphs were also exported from the same pinned Diffusers mirror and passed full ONNX validation. On the SM8550 Galaxy S23 v73 reference, decoder compile/link/profile succeeded (`jp37xmxzg`, `jgowovodp`, `jp8r6748g`) and all 161 profile entries reported `compute_unit=NPU`; encoder compile/link/profile succeeded (`jp11787lp`, `jgd48v8lg`, `jgk0oy9o5`) and all 128 entries reported `compute_unit=NPU`. Their linked context binaries were downloaded (decoder 165,076,992 bytes; encoder 103,813,120 bytes). This is NPU execution on the reference, not SM8735/POCO F7 validation.
 
